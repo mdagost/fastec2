@@ -462,8 +462,8 @@ class EC2():
         inst = self.get_instance(inst)
         name = inst.name
         ssh = self.ssh(inst, user, keyfile, private_ips)
+        shutil.copy(scriptname, Path.home()/'fastec2'/name/scriptname)
         self.setup_files(ssh, name, keyfile)
-        shutil.copy(scriptname, Path.home()/'fastec2'/'name')
         ssh.send(f'cd fastec2/{name}')
         ssh.send(f'chmod u+x {scriptname}')
         ssh.send('./'+scriptname)
