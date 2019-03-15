@@ -28,7 +28,7 @@ boto3.resources.base.ServiceResource.name = property(_boto3_name)
 def _boto3_repr(self):
     clname =  self.__class__.__name__
     if clname == 'ec2.Instance':
-        return f'{self.name} ({self.id} {self.instance_type} {self.state["Name"]}): {self.public_ip_address or "No public IP"}'
+        return f'{self.name} ({self.id} {self.instance_type} {self.state["Name"]}): {self.public_ip_address or self.private_ip_address}'
     elif clname == 'ec2.Volume':
         return f'{self.name} ({self.id} {self.state}): {self.size}GB'
     elif clname == 'ec2.Snapshot':
@@ -282,14 +282,17 @@ class EC2():
         self.create_name(snid, name)
         return ami
 
-    def _launch_spec(self, ami, keyname, disksize, instancetype, secgroupid, iops=None):
+    def _launch_spec(self, ami, keyname, disksize, instancetype, secgroupid, iops=None, subnetid=None):
         assert self._describe('key_pairs', {'key-name':keyname}), 'key not found'
         ami = self.get_ami(ami)
         ebs = ({'VolumeSize': disksize, 'VolumeType': 'io1', 'Iops': iops }
                  if iops else {'VolumeSize': disksize, 'VolumeType': 'gp2'})
-        return { 'ImageId': ami.id, 'InstanceType': instancetype,
-            'SecurityGroupIds': [secgroupid], 'KeyName': keyname,
-            "BlockDeviceMappings": [{ "DeviceName": "/dev/sda1", "Ebs": ebs, }] }
+        spec = { 'ImageId': ami.id, 'InstanceType': instancetype,
+                 'SecurityGroupIds': [secgroupid], 'KeyName': keyname,
+                 "BlockDeviceMappings": [{ "DeviceName": "/dev/sda1", "Ebs": ebs, }] }
+        if subnetid is not None:
+            spec["SubnetId"] = subnetid
+        return spec
 
     def _get_request(self, srid):
         srs = self._describe('spot_instance_requests', {'spot-instance-request-id':srid})
@@ -305,8 +308,8 @@ class EC2():
     def remove_name(self, resource_id):
         self._ec2.delete_tags(Resources=[resource_id],Tags=[{"Key": 'Name'}])
 
-    def request_spot(self, name, ami, keyname, disksize, instancetype, secgroupid, iops=None):
-        spec = self._launch_spec(ami, keyname, disksize, instancetype, secgroupid, iops)
+    def request_spot(self, name, ami, keyname, disksize, instancetype, secgroupid, iops=None, subnetid=None):
+        spec = self._launch_spec(ami, keyname, disksize, instancetype, secgroupid, iops, subnetid)
         sr = result(self._ec2.request_spot_instances(
             LaunchSpecification=spec, InstanceInterruptionBehavior='stop', Type='persistent'))
         assert len(sr)==1, 'spot request failed'
@@ -318,43 +321,45 @@ class EC2():
         self.create_name(sr.id, name)
         return sr
 
-    def request_demand(self, ami, keyname, disksize, instancetype, secgroupid, iops=None):
-        spec = self._launch_spec(ami, keyname, disksize, instancetype, secgroupid, iops)
+    def request_demand(self, ami, keyname, disksize, instancetype, secgroupid, iops=None, subnetid=None):
+        spec = self._launch_spec(ami, keyname, disksize, instancetype, secgroupid, iops, subnetid)
         return self._ec2r.create_instances(MinCount=1, MaxCount=1, **spec)[0]
 
-    def _wait_ssh(self, inst):
+    def _wait_ssh(self, inst, private_ips):
         self.waitfor('instance', 'running', inst.id)
+        ip = inst.private_ip_address if private_ips else inst.public_ip_address
         for i in range(720//5):
             try:
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    s.connect((inst.public_ip_address, 22))
+                    s.connect((ip, 22))
                     time.sleep(1)
                 return inst
             except (ConnectionRefusedError,BlockingIOError): time.sleep(5)
 
     def get_launch(self, name, ami, disksize, instancetype, keyname:str='default', secgroupname:str='ssh',
-                   iops:int=None, spot:bool=False):
+                   iops:int=None, spot:bool=False, subnetid:Union[str, None]=None, private_ips:bool=False):
         "Creates new instance `name` and returns `Instance` object"
         insts = self._describe('instances', {'tag:Name':name})
         assert not insts, 'name already exists'
         secgroupid = self.get_secgroup(secgroupname).id
         if spot:
-            sr = self.request_spot(name, ami, keyname, disksize, instancetype, secgroupid, iops)
+            sr = self.request_spot(name, ami, keyname, disksize, instancetype, secgroupid, iops, subnetid)
             inst = self._ec2r.Instance(sr.instance_id)
         else:
-            inst = self.request_demand(ami, keyname, disksize, instancetype, secgroupid, iops)
+            inst = self.request_demand(ami, keyname, disksize, instancetype, secgroupid, iops, subnetid)
         self.waitfor('instance','running', inst.id)
         inst.load()
         self.create_name(inst.id, name)
-        self._wait_ssh(inst)
+        self._wait_ssh(inst, private_ips)
         inst.load()
         return inst
 
     def ip(self, inst): return self.get_instance(inst).public_ip_address
 
     def launch(self, name, ami, disksize, instancetype, keyname:str='default',
-               secgroupname:str='ssh', iops:int=None, spot:bool=False):
-        print(self.get_launch(name, ami, disksize, instancetype, keyname, secgroupname, iops, spot))
+               secgroupname:str='ssh', iops:int=None, spot:bool=False,
+               subnetid:str=None, private_ips:bool=False):
+        print(self.get_launch(name, ami, disksize, instancetype, keyname, secgroupname, iops, spot, subnetid, private_ips))
 
     def instance(self, inst:str):
         "Show `Instance` details for `inst`"
@@ -380,39 +385,41 @@ class EC2():
         "Stops instance `inst`"
         self.get_instance(inst).stop()
 
-    def connect(self, inst, ports=None, user=None, keyfile='~/.ssh/id_rsa'):
+    def connect(self, inst, ports=None, user=None, keyfile='~/.ssh/id_rsa', private_ips=False):
         """Replace python process with an ssh process connected to instance `inst`;
         use `user@name` otherwise defaults to user 'ubuntu'. `ports` (int or list) creates tunnels"""
         if user is None:
             if isinstance(inst,str) and '@' in inst: user,inst = inst.split('@')
             else: user = 'ubuntu'
         inst = self.get_instance(inst)
+        ip = inst.private_ip_address if private_ips else inst.public_ip_address
         #tunnel = []
         tunnel = [f'-L {o}:localhost:{o}' for o in listify(ports)]
-        os.execvp('ssh', ['ssh', f'{user}@{inst.public_ip_address}',
+        os.execvp('ssh', ['ssh', f'{user}@{ip}',
                           '-i', os.path.expanduser(keyfile), *tunnel])
 
-    def sshs(self, inst, user='ubuntu', keyfile='~/.ssh/id_rsa'):
+    def sshs(self, inst, user='ubuntu', keyfile='~/.ssh/id_rsa', private_ips=False):
         inst = self.get_instance(inst)
-        ssh = self.ssh(inst, user=user, keyfile=keyfile)
+        ssh = self.ssh(inst, user=user, keyfile=keyfile, private_ips=private_ips)
         ftp = pysftp.Connection(ssh)
         return inst,ssh,ftp
 
-    def ssh(self, inst, user='ubuntu', keyfile='~/.ssh/id_rsa'):
+    def ssh(self, inst, user='ubuntu', keyfile='~/.ssh/id_rsa', private_ips=False):
         "Return a paramiko ssh connection objected connected to instance `inst`"
         inst = self.get_instance(inst)
         keyfile = os.path.expanduser(keyfile)
         key = paramiko.RSAKey.from_private_key_file(keyfile)
+        ip = inst.private_ip_address if private_ips else inst.public_ip_address
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(hostname=inst.public_ip_address, username=user, pkey=key)
+        client.connect(hostname=ip, username=user, pkey=key)
         client.raise_stderr = True
         client.inst = inst
         client.user = user
         client.launch_tmux()
         return client
 
-    def setup_files(self, ssh, name):
+    def setup_files(self, ssh, name, private_ips=False):
         fpath = Path.home()/'fastec2'
         (fpath/name).mkdir(parents=True, exist_ok=True)
         (fpath/'files').mkdir(parents=True, exist_ok=True)
@@ -424,7 +431,7 @@ class EC2():
         ssh.send('mkdir -p ~/fastec2')
         ssh.send(f'export FE2_DIR=~/fastec2/{name}')
         ssh.send(f'echo {name} > ~/fastec2/current')
-        ip = ssh.inst.public_ip_address
+        ip = inst.private_ip_address if private_ips else inst.public_ip_address
         os.system(f"rsync -e 'ssh -o StrictHostKeyChecking=no' -az {fpath/'files'}/ {ssh.user}@{ip}:fastec2/{name}/")
         os.system(f"rsync -e 'ssh -o StrictHostKeyChecking=no' -az {fpath/name} {ssh.user}@{ip}:fastec2/")
 
@@ -451,10 +458,10 @@ class EC2():
         ssh.send(f'echo To run: sudo systemctl start {script}')
         ssh.send(f'echo To monitor: journalctl -f -u {script}')
 
-    def script(self, scriptname, inst, user='ubuntu', keyfile='~/.ssh/id_rsa'):
+    def script(self, scriptname, inst, user='ubuntu', keyfile='~/.ssh/id_rsa', private_ips=False):
         inst = self.get_instance(inst)
         name = inst.name
-        ssh = self.ssh(inst, user, keyfile)
+        ssh = self.ssh(inst, user, keyfile, private_ips)
         self.setup_files(ssh, name)
         shutil.copy(scriptname, fpath/'name')
         ssh.send(f'cd fastec2/{name}')
