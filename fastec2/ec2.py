@@ -431,9 +431,9 @@ class EC2():
         ssh.send('mkdir -p ~/fastec2')
         ssh.send(f'export FE2_DIR=~/fastec2/{name}')
         ssh.send(f'echo {name} > ~/fastec2/current')
-        ip = inst.private_ip_address if private_ips else inst.public_ip_address
-        os.system(f"rsync -e 'ssh -o StrictHostKeyChecking=no' -i {keyfile} -az {fpath/'files'}/ {ssh.user}@{ip}:fastec2/{name}/")
-        os.system(f"rsync -e 'ssh -o StrictHostKeyChecking=no' -i {keyfile} -az {fpath/name} {ssh.user}@{ip}:fastec2/")
+        ip = ssh.inst.private_ip_address if private_ips else ssh.inst.public_ip_address
+        os.system(f"rsync -e 'ssh -o StrictHostKeyChecking=no -i {keyfile}' -az {fpath/'files'}/ {ssh.user}@{ip}:fastec2/{name}/")
+        os.system(f"rsync -e 'ssh -o StrictHostKeyChecking=no -i {keyfile}' -az {fpath/name} {ssh.user}@{ip}:fastec2/")
 
     def setup_lsync(self, ssh, name, myip, conf_fn='sync.conf'):
         if myip is None:
